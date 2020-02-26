@@ -1,14 +1,18 @@
 
-## TEST TOOLS
+## TEST TOOLS 
 
-Prerequisites:
+Prerequisites: 
+
 $ sudo apt install curl
+
 $ cargo install --features=ssl websocat
 
 GET example:
+
 $ curl -X GET "http://localhost:3030/boobs/1"
 
 POST example:
+
 $ curl -H "Content-Type: application/json" -d '{"name":"Roman","rate":5}' "http://localhost:3030/employees"
 
 add -v to see error code
