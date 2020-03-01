@@ -1,34 +1,98 @@
 
-extern crate pretty_env_logger;
-#[macro_use] extern crate log;
+use futures::channel::mpsc;
+use futures::prelude::*;
+use std::net::SocketAddr;
+use tokio::runtime::Runtime;
 
-use serde_derive::{Deserialize, Serialize};
-use std::convert::Infallible;
-use std::str::FromStr;
-use std::time::Duration;
-use warp::Filter;
-use futures::{FutureExt, StreamExt};
+#[macro_use]
+extern crate log;
 
-#[tokio::main]
-async fn main() {
-    pretty_env_logger::init();
-    info!("such information2");
+//mod error;
+mod usb;
+//mod web;
+mod usbfutures;
 
-    let routes = warp::path("echo")
-        // The `ws()` filter will prepare the Websocket handshake.
-        .and(warp::ws())
-        .map(|ws: warp::ws::Ws| {
-            // And then our closure will be called when it completes...
-            ws.on_upgrade(|websocket| {
-                // Just echo all messages back...
-                let (tx, rx) = websocket.split();
-                rx.forward(tx).map(|result| {
-                    if let Err(e) = result {
-                        eprintln!("websocket error: {:?}", e);
+use usb::USBDevices;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Check if the user requested some specific log level via an env variable. Otherwise set log
+    // level to something reasonable.
+    if let Ok(_) = std::env::var("RUST_LOG") {
+        env_logger::init();
+    } else {
+        env_logger::Builder::new()
+            .filter_level(log::LevelFilter::Info)
+            .init();
+    }
+    println!("Set RUST_LOG=<filter> to enable logging. Example RUST_LOG=debug");
+
+    // Create an async runtime for spawning futures on
+    let mut rt = Runtime::new()?;
+
+    // Create the global state that can be shared between threads
+    let usb_devices = USBDevices::new()?;
+
+    // Create a channel with which it is possible to request a refresh of usb devices. A length of
+    // 1 is enough since it doesn't make sense to request more refreses than the refresh task can
+    // execute.
+    let (mut notify_tx, notify_rx) = mpsc::channel(1);
+    // Trigger one refresh on startup
+    //web::notify(&mut notify_tx);
+    notify_tx.try_send(()).expect("Startup trigger not worked");
+
+    // Create and spawn the future that polls for USB devices
+    let usb_poller = {
+        let usb_devices = usb_devices.clone();
+        async move {
+            if let Err(e) = usb_devices.presence_detector(notify_rx).await {
+                error!("Stopped polling for usb devices: {}", e);
+            }
+        }
+    };
+
+    let echo = {
+        let usb_devices = usb_devices.clone();
+        async move {
+            tokio::time::delay_for(std::time::Duration::from_secs(1)).await;
+            let list = usb_devices.devices().await;
+            info!("List of devices: {:#?}", &list);
+            assert!(list.len() > 0, "No devices in list");
+
+            let dev = usb_devices.acquire_device(&list[0]["path"]).await;
+            let mut echo = vec![0x0u8;1];
+            loop {
+                if let Ok(Some((mut tx, mut rx))) = dev {
+                    loop {
+                        info!("Echo In : {:x?}", &echo);
+                        tx.send(echo.clone()).await.expect("Echo: cant not send");
+                        match rx.next().await {
+                            Some(r) => {
+                                echo[0] = r[0];
+                                info!("Echo Out : {:x?}", r)
+                            }
+                            None => error!("Echo: no recive data"),
+                        };
+                        tokio::time::delay_for(std::time::Duration::from_millis(250)).await; 
                     }
-                })
-            })
-        });
+                }
+                else { error!("Echo: no device channels") }
+                tokio::time::delay_for(std::time::Duration::from_secs(1)).await;
+            }
+        }
+    };
 
-    warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
+    let addr: SocketAddr = "127.0.0.1:3333".parse()?;
+
+    println!("listening on http://{}", addr);
+    //let server = web::create(usb_devices, notify_tx, addr);
+
+    rt.block_on(async move {
+        tokio::select! {
+            //_ = server => info!("Warp returned"),
+            _ = usb_poller => info!("Usb poller died"),
+            _ = echo => info!("Echo ended"),
+        }
+    });
+
+    Ok(())
 }
