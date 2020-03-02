@@ -35,22 +35,41 @@ struct DeviceInner {
     buffer_pos: usize,
 }
 
+// Proxy object to implement more than one AsyncRead trait
+pub struct VisInner {
+    device: Arc<DeviceHandle<'static>>,
+    read_thread: Option<std::thread::JoinHandle<()>>,
+    rstate: ReadState,
+    data_rx: mpsc::Receiver<Option<[u8; 64]>>, // One message per read
+    req_tx: Option<mpsc::Sender<Waker>>,       // One message per expected read
+    buffer: Option<[u8; 64]>,
+    buffer_pos: usize,
+}
+
+pub struct VisProxy {
+    inner: Option<Arc<Mutex<VisInner>>>,
+}
+
 pub struct Device {
     // store an Option so that `close` works
     inner: Option<Arc<Mutex<DeviceInner>>>,
+    pub vis: VisProxy,
 }
 
 impl Clone for Device {
     fn clone(&self) -> Self {
         Device {
             inner: self.inner.as_ref().map(|dev| Arc::clone(&dev)),
+            vis : VisProxy {
+                inner: self.vis.inner.as_ref().map(|dev| Arc::clone(&dev)),
+            }
         }
     }
 }
 
 impl Drop for Device {
     fn drop(&mut self) {
-        debug!("dropping hid connection");
+        debug!("dropping libusb connection");
         if let Some(inner) = self.inner.take() {
             if let Ok(mut guard) = inner.lock() {
                 // Take the waker queue and drop it so that the reader thread finihes
@@ -71,11 +90,11 @@ impl Drop for Device {
         } else {
             error!("there was no inner");
         }
+        //TODO: VisProxy
     }
 }
 
-impl Device {
-    pub fn new(device: DeviceHandle<'static>) -> Result<Self, Error> {
+impl Device { pub fn new(device: DeviceHandle<'static>) -> Result<Self, Error> {
         let (data_tx, data_rx) = mpsc::channel();
         let (req_tx, req_rx) = mpsc::channel::<Waker>();
 
@@ -124,7 +143,7 @@ impl Device {
         });
         Ok(Device {
             inner: Some(Arc::new(Mutex::new(DeviceInner {
-                device,
+                device: Arc::clone(&device),
                 read_thread: Some(jh),
                 rstate: ReadState::Idle,
                 data_rx,
@@ -132,6 +151,17 @@ impl Device {
                 buffer: None,
                 buffer_pos: 0,
             }))),
+            vis : VisProxy {
+                inner: Some(Arc::new(Mutex::new(VisInner {
+                    device,
+                    read_thread: None,
+                    rstate: ReadState::Idle,
+                    data_rx : todo!(),
+                    req_tx: None,
+                    buffer: None,
+                    buffer_pos: 0,
+                }))),
+            }
         })
     }
 }
@@ -276,3 +306,94 @@ impl AsyncRead for Device {
         }
     }
 }
+
+impl AsyncRead for VisProxy {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        if self.inner.is_none() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Cannot poll a closed device",
+            )));
+        }
+        let mut this =
+            self.inner.as_mut().unwrap().lock().map_err(|e| {
+                io::Error::new(io::ErrorKind::Other, format!("Mutex broken: {:?}", e))
+            })?;
+        loop {
+            let waker = cx.waker().clone();
+            match this.rstate {
+                ReadState::Idle => {
+                    debug!("Sending waker");
+                    if let Some(req_tx) = &mut this.req_tx {
+                        if let Err(_e) = req_tx.send(waker) {
+                            error!("failed to send waker");
+                        }
+                    } else {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Failed internal send",
+                        )));
+                    }
+                    this.rstate = ReadState::Busy;
+                }
+                ReadState::Busy => {
+                    // First send any bytes from the previous readout
+                    if let Some(inner_buf) = this.buffer.take() {
+                        let len = usize::min(buf.len(), inner_buf.len());
+                        let inner_slice = &inner_buf[this.buffer_pos..this.buffer_pos + len];
+                        let buf_slice = &mut buf[..len];
+                        buf_slice.copy_from_slice(inner_slice);
+                        // Check if there is more data left
+                        if this.buffer_pos + inner_slice.len() < inner_buf.len() {
+                            this.buffer = Some(inner_buf);
+                            this.buffer_pos += inner_slice.len();
+                        } else {
+                            this.rstate = ReadState::Idle;
+                        }
+                        return Poll::Ready(Ok(len));
+                    }
+
+                    // Second try to receive more bytes
+                    let vec = match this.data_rx.try_recv() {
+                        Ok(Some(vec)) => vec,
+                        Ok(None) => {
+                            // end of stream?
+                            return Poll::Pending;
+                        }
+                        Err(e) => match e {
+                            mpsc::TryRecvError::Disconnected => {
+                                return Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::Other,
+                                    format!("Inner channel dead"),
+                                )));
+                            }
+                            mpsc::TryRecvError::Empty => {
+                                return Poll::Pending;
+                            }
+                        },
+                    };
+                    debug!("Read data {:?}", &vec[..]);
+                    let len = usize::min(vec.len(), buf.len());
+                    let buf_slice = &mut buf[..len];
+                    let vec_slice = &vec[..len];
+                    buf_slice.copy_from_slice(vec_slice);
+                    if len < vec.len() {
+                        // If bytes did not fit in buf, store bytes for next readout
+                        this.buffer = Some(vec);
+                        this.buffer_pos = 0;
+                    } else {
+                        this.rstate = ReadState::Idle;
+                    }
+                    debug!("returning {}", len);
+                    return Poll::Ready(Ok(len));
+                }
+            };
+        }
+    }
+}
+
+

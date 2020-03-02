@@ -23,7 +23,10 @@ pub const EP_DATA_IN: u8 = 0x86;
 
 struct DeviceEntry {
     acquired: DeviceAcquiredState,
+    manufacturer: String,
     product: String,
+    serial: String,
+    bcd_device: String,
 }
 
 enum DeviceAcquiredState {
@@ -42,15 +45,30 @@ impl std::fmt::Debug for DeviceEntry {
 }
 
 impl DeviceEntry {
-    pub fn new(product: &str) -> Self {
+    pub fn new(manufacturer: &str, product: &str, serial: &str, bcd_device: &str) -> Self {
         DeviceEntry {
             acquired: DeviceAcquiredState::Available,
+            manufacturer: manufacturer.to_string(),
             product: product.to_string(),
+            serial: serial.to_string(),
+            bcd_device: bcd_device.to_string(),
         }
+    }
+
+    pub fn manufacturer(&self) -> &str {
+        &self.manufacturer
     }
 
     pub fn product(&self) -> &str {
         &self.product
+    }
+
+    pub fn serial(&self) -> &str {
+        &self.serial
+    }
+
+    pub fn bcd_device(&self) -> &str {
+        &self.bcd_device
     }
 
     pub fn acquire(&mut self, tx: mpsc::Sender<oneshot::Sender<()>>) {
@@ -112,7 +130,10 @@ impl USBDevices {
                     "path".into(),
                     device.0.to_string(),
                 );
+                d.insert("manufacturer".into(), device.1.manufacturer().to_string());
                 d.insert("product".into(), device.1.product().to_string());
+                d.insert("serial".into(), device.1.serial().to_string());
+                d.insert("bcdDevice".into(), device.1.bcd_device().to_string());
                 d
             })
             .collect()
@@ -164,6 +185,33 @@ impl USBDevices {
                 let path = { 
                     device.bus_number().to_string() + ":" + &device.address().to_string()
                 };
+                let timeout = std::time::Duration::from_millis(100);
+                let (manufacturer, product, serial, bcd_device) = match device.open() {
+                    Ok(device) => {
+                        match device.read_languages(timeout) {
+                            Ok(lang) if lang.len() > 0 => {
+                                let manufacturer = device.read_manufacturer_string(lang[0], &device_desc, timeout)
+                                    .unwrap_or_else(|e| String::from(format!("manufacturer read error: {:?}", e)));
+                                let product = device.read_product_string(lang[0], &device_desc, timeout)
+                                    .unwrap_or_else(|e| String::from(format!("product read error: {:?}", e)));
+                                let serial = device.read_serial_number_string(lang[0], &device_desc, timeout)
+                                    .unwrap_or_else(|e| String::from(format!("serial read error: {:?}", e)));
+                                let version = device_desc.device_version();
+                                let bcd_device = String::from(format!("{}.{}", version.major(), version.minor()));
+                                (manufacturer, product, serial, bcd_device)
+                            }
+                            _ => {
+                                error!("Can't read lang descriptor, device: {}", &path);
+                                (String::from("none"), String::from("none"), String::from("none"), String::from(""))
+                            }
+                        }
+                    }
+                    Err(_e) => {
+                        error!("Can't open device: {} to read descriptor strings", &path);
+                        (String::from("none"), String::from("none"), String::from("none"), String::from(""))
+                    }
+                };
+
                 //let product = match device.product_string.as_ref() {
                 //    Some(product) => product,
                 //    None => {
@@ -176,7 +224,7 @@ impl USBDevices {
                     Entry::Occupied(_) => (),
                     Entry::Vacant(v) => {
                         info!("Found Holter monitor at {}!", path);
-                        v.insert(DeviceEntry::new(&String::from("TODO:")));
+                        v.insert(DeviceEntry::new(&manufacturer, &product, &serial, &bcd_device));
                     }
                 }
             }
