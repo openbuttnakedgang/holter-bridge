@@ -1,8 +1,12 @@
-
 use futures::channel::mpsc;
 use futures::prelude::*;
 use std::net::SocketAddr;
 use tokio::runtime::Runtime;
+use ellocopo::MsgBuilder;
+use ellocopo::OperationStatus;
+use ellocopo::Error;
+
+use crate::parser::pars_answer;
 
 #[macro_use]
 extern crate log;
@@ -11,6 +15,7 @@ extern crate log;
 mod usb;
 //mod web;
 mod usbfutures;
+mod parser;
 
 use usb::USBDevices;
 
@@ -59,16 +64,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             assert!(list.len() > 0, "No devices in list");
 
             let dev = usb_devices.acquire_device(&list[0]["path"]).await;
-            let mut echo = vec![0x0u8;1];
+            let mut echo = [0u8; 0x40];
             loop {
                 if let Ok(Some((mut tx, mut rx))) = dev {
                     loop {
-                        info!("Echo In : {:x?}", &echo);
-                        tx.send(echo.clone()).await.expect("Echo: cant not send");
+                        let request_sz = MsgBuilder::request(&mut echo)
+                            .operation(OperationStatus::Read)
+                            .name("build.profile")
+                            .build();
+                        let echo = &echo[0..request_sz];
+                        let name = unsafe { core::str::from_utf8_unchecked(&echo[3..]) };
+                        info!("builder name: {}", name);
+                        info!("Echo In : {:x?}", &echo[..]);
+                        tx.send(echo.to_vec()).await.expect("Echo: cant not send");
                         match rx.next().await {
                             Some(r) => {
-                                echo[0] = r[0];
-                                info!("Echo Out : {:x?}", r)
+                                info!("Echo Out : {:x?}", r);
+                                //let r = &r[0..request_sz];
+                                let ans = pars_answer(&r);
+                                info!("Answer : {:x?}", ans);
                             }
                             None => error!("Echo: no recive data"),
                         };

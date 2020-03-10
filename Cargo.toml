@@ -19,3 +19,4 @@ clap = "2.33"
 warp = "0.2.1"
 libusb = "0.3"
 async-std = "1.2"
+ellocopo = { path="/home/fmv/Документы/ellocopo/ellocopo"}
