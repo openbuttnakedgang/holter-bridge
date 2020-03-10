@@ -5,8 +5,10 @@ use tokio::runtime::Runtime;
 use ellocopo::MsgBuilder;
 use ellocopo::OperationStatus;
 use ellocopo::Error;
+use std::collections::HashMap;
 
 use crate::parser::pars_answer;
+use warp::{self, Filter, Rejection};
 
 #[macro_use]
 extern crate log;
@@ -18,6 +20,15 @@ mod usbfutures;
 mod parser;
 
 use usb::USBDevices;
+
+async fn list_devices(usb_devices: USBDevices) -> Result<impl warp::Reply, Rejection> {
+    let list = usb_devices.devices().await;
+    info!("List of devices: {:#?}", &list);
+    let mut map = HashMap::new();
+    map.insert("devices", list);
+    let reply = warp::reply::json(&map);
+    Ok(reply)
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Check if the user requested some specific log level via an env variable. Otherwise set log
@@ -98,13 +109,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr: SocketAddr = "127.0.0.1:3333".parse()?;
 
     println!("listening on http://{}", addr);
+
+    /*async {
+        let usb_devices = usb_devices.clone();
+        let list = usb_devices.devices().await;
+        info!("List of devices: {:#?}", &list);
+        assert!(list.len() > 0, "No devices in list");
+    };*/
+
+
+    let usb_devices = warp::any().map(move || (usb_devices.clone()));
     //let server = web::create(usb_devices, notify_tx, addr);
+    let device_list = warp::path!("devices" / "list")
+    .and(usb_devices.clone())
+    .and_then(list_devices)
+    .map(|reply| { 
+        reply
+    });
+
+    let websocket_vis = warp::path!("api1" / "001" / "vis")
+    .and(warp::ws())
+    .map(||)
+
+    let hello = warp::path("hello").map(|| {"Hello"});
+
+    let routes = warp::get().and(device_list.or(hello));
+
+    let server = warp::serve(routes).run(addr);
 
     rt.block_on(async move {
         tokio::select! {
-            //_ = server => info!("Warp returned"),
+            _ = server => info!("Warp returned"),
             _ = usb_poller => info!("Usb poller died"),
-            _ = echo => info!("Echo ended"),
+            //_ = echo => info!("Echo ended"),
         }
     });
 
