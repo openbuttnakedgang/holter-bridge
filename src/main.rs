@@ -1,33 +1,73 @@
+use ellocopo2::AnswerCode;
+use ellocopo2::ParseMsg;
+use ellocopo2::RequestBuilder;
 use futures::channel::mpsc;
 use futures::prelude::*;
 use std::net::SocketAddr;
 use tokio::runtime::Runtime;
-use ellocopo::MsgBuilder;
-use ellocopo::OperationStatus;
-use ellocopo::Error;
+//use ellocopo::OperationStatus;
 use std::collections::HashMap;
 
-use crate::parser::pars_answer;
+//use crate::parser::pars_answer;
+use tokio::sync::{mpsc as t_mpsc, Mutex};
+use warp::ws::{Message, WebSocket};
 use warp::{self, Filter, Rejection};
+
+use std::sync::{atomic::AtomicBool, Arc};
 
 #[macro_use]
 extern crate log;
 
 //mod error;
 mod usb;
-//mod web;
 mod usbfutures;
-mod parser;
+mod web;
+//mod parser;
 
 use usb::USBDevices;
 
-async fn list_devices(usb_devices: USBDevices) -> Result<impl warp::Reply, Rejection> {
+pub struct GlobalState {
+    pub vis: Arc<AtomicBool>,
+}
+
+impl GlobalState {
+    pub fn new() -> Self {
+        Self {
+            vis: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl Clone for GlobalState {
+    fn clone(&self) -> Self {
+        Self {
+            vis: self.vis.clone(),
+        }
+    }
+}
+
+async fn send_command(usb_devices: USBDevices, msg: ellocopo2::owned::Msg) -> Result<(), String> {
+    let usb_devices = usb_devices.clone();
+    tokio::time::delay_for(std::time::Duration::from_secs(1)).await;
     let list = usb_devices.devices().await;
     info!("List of devices: {:#?}", &list);
-    let mut map = HashMap::new();
-    map.insert("devices", list);
-    let reply = warp::reply::json(&map);
-    Ok(reply)
+    assert!(list.len() > 0, "No devices in list");
+
+    let dev = usb_devices.acquire_device(&list[0]["path"]).await;
+    if let Ok(Some((mut tx, mut rx))) = dev {
+        tx.send(msg).await.expect("Echo: cant not send");
+        match rx.next().await {
+            Some(r) => {
+                let ellocopo2::owned::Msg(code, path, value) = r;
+                info!("Finally here!: {:?}", value);
+                return Ok(());
+            }
+            None => Err("Echo: no recive data".to_string()),
+        }
+    } else {
+        error!("Echo: no device channels");
+        return Err("Echo: no device channels".to_string());
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -37,7 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         env_logger::init();
     } else {
         env_logger::Builder::new()
-            .filter_level(log::LevelFilter::Info)
+            .filter_level(log::LevelFilter::Debug)
             .init();
     }
     println!("Set RUST_LOG=<filter> to enable logging. Example RUST_LOG=debug");
@@ -68,74 +108,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let echo = {
         let usb_devices = usb_devices.clone();
+        let msg = ellocopo2::owned::Msg(
+            AnswerCode::OK_WRITE,
+            "/ctrl/vis".to_string(),
+            ellocopo2::owned::Value::BOOL(true),
+        );
+        let msg1 = ellocopo2::owned::Msg(
+            AnswerCode::OK_READ,
+            "/ctrl/vis".to_string(),
+            ellocopo2::owned::Value::UNIT(()),
+        );
         async move {
-            tokio::time::delay_for(std::time::Duration::from_secs(1)).await;
+            send_command(usb_devices.clone(), msg).await;
+            send_command(usb_devices.clone(), msg1).await;
+            /*tokio::time::delay_for(std::time::Duration::from_secs(1)).await;
             let list = usb_devices.devices().await;
             info!("List of devices: {:#?}", &list);
             assert!(list.len() > 0, "No devices in list");
 
             let dev = usb_devices.acquire_device(&list[0]["path"]).await;
-            let mut echo = [0u8; 0x40];
-            loop {
-                if let Ok(Some((mut tx, mut rx))) = dev {
-                    loop {
-                        let request_sz = MsgBuilder::request(&mut echo)
-                            .operation(OperationStatus::Read)
-                            .name("build.profile")
-                            .build();
-                        let echo = &echo[0..request_sz];
-                        let name = unsafe { core::str::from_utf8_unchecked(&echo[3..]) };
-                        info!("builder name: {}", name);
-                        info!("Echo In : {:x?}", &echo[..]);
-                        tx.send(echo.to_vec()).await.expect("Echo: cant not send");
-                        match rx.next().await {
-                            Some(r) => {
-                                info!("Echo Out : {:x?}", r);
-                                //let r = &r[0..request_sz];
-                                let ans = pars_answer(&r);
-                                info!("Answer : {:x?}", ans);
-                            }
-                            None => error!("Echo: no recive data"),
-                        };
-                        tokio::time::delay_for(std::time::Duration::from_millis(250)).await; 
+            if let Ok(Some((mut tx, mut rx))) = dev {
+                let msg = ellocopo2::owned::Msg(AnswerCode::OK_READ, "/survey/surname".to_string(), ellocopo2::owned::Value::UNIT(()));
+                tx.send(msg).await.expect("Echo: cant not send");
+                match rx.next().await {
+                    Some(r) => {
+                        let ellocopo2::owned::Msg (code, path, value) = r;
+                        info!("Finally here!: {:?}", value);
                     }
+                    None => error!("Echo: no recive data"),
                 }
-                else { error!("Echo: no device channels") }
-                tokio::time::delay_for(std::time::Duration::from_secs(1)).await;
             }
+            else { error!("Echo: no device channels") }*/
         }
     };
+
+    let state: GlobalState = GlobalState::new();
 
     let addr: SocketAddr = "127.0.0.1:3333".parse()?;
 
     println!("listening on http://{}", addr);
 
-    /*async {
-        let usb_devices = usb_devices.clone();
-        let list = usb_devices.devices().await;
-        info!("List of devices: {:#?}", &list);
-        assert!(list.len() > 0, "No devices in list");
-    };*/
-
-
-    let usb_devices = warp::any().map(move || (usb_devices.clone()));
-    //let server = web::create(usb_devices, notify_tx, addr);
-    let device_list = warp::path!("devices" / "list")
-    .and(usb_devices.clone())
-    .and_then(list_devices)
-    .map(|reply| { 
-        reply
-    });
-
-    let websocket_vis = warp::path!("api1" / "001" / "vis")
-    .and(warp::ws())
-    .map(||)
-
-    let hello = warp::path("hello").map(|| {"Hello"});
-
-    let routes = warp::get().and(device_list.or(hello));
-
-    let server = warp::serve(routes).run(addr);
+    let server = web::create(addr, state.clone(), usb_devices);
 
     rt.block_on(async move {
         tokio::select! {
@@ -146,4 +159,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+
+    use ellocopo2::Value;
+    use serde::{Deserialize, Serialize};
+
+    #[test]
+    fn test1() {
+        let val = Value::STR("Hello world");
+        let j = serde_json::to_string(&val).unwrap();
+        println!("{}", &j);
+
+        let v: Value = serde_json::from_str(&j).unwrap();
+        println!("{:?}", v);
+
+        let val = Value::BYTES(&[1, 2, 3, 4]);
+        let j = serde_json::to_string(&val);
+        println!("{}", j.unwrap());
+
+        let val = Value::BOOL(true);
+        let j = serde_json::to_string(&val);
+        println!("{}", j.unwrap());
+
+        let val = Value::U32(7);
+        let j = serde_json::to_string(&val);
+        println!("{}", j.unwrap());
+
+        let val = Value::UNIT(());
+        let j = serde_json::to_string(&val).unwrap();
+        println!("{}", &j);
+    }
 }

@@ -10,6 +10,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
 
+use ellocopo2::owned::*;
+use ellocopo2::Msg as NotOwnMsg;
+use ellocopo2::Value as NotOwnValue; 
+
 ///  USB Consts
 pub const VID: u16 = 0x0483;
 pub const PID: u16 = 0x7503;
@@ -189,21 +193,24 @@ impl USBDevices {
     pub async fn acquire_device(
         &self,
         path: &str,
-    ) -> Result<Option<(mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>)>, Box<dyn std::error::Error>>
+    ) -> Result<Option<(mpsc::Sender<Msg>, mpsc::Receiver<Msg>)>, Box<dyn std::error::Error + Send>>
     {
         if let Some(device) = self.devices.lock().await.get_mut(path) {
             // Make sure device is released
             device.release().await;
 
-            let (in_tx, in_rx) = mpsc::channel(128);
-            let (out_tx, out_rx) = mpsc::channel(128);
+            let (in_tx, in_rx) = mpsc::channel::<Msg>(128);
+            let (out_tx, out_rx) = mpsc::channel::<Msg>(128);
             
             // TODO: use path
             let libusb_device = match self.libusb.open_device_with_vid_pid(VID, PID) {
                 Some(device) => device,
-                None => Err(libusb::Error::NoDevice)?
+                None => Err(libusb::Error::NoDevice).unwrap()
             };
-            let libusb_device = Device::new(libusb_device)?;
+            let libusb_device = match Device::new(libusb_device) {
+                Ok(libusb_device) => libusb_device,
+                _ => Err(libusb::Error::NoDevice).unwrap()
+            };
             info!("Successfully acquired device: {}", path);
             let (on_close_tx, on_close_rx) = mpsc::channel(1);
             device.acquire(on_close_tx);
@@ -216,10 +223,14 @@ impl USBDevices {
     }
 }
 
+use ellocopo2::RequestBuilder;
+use ellocopo2::ParseMsg;
+use std::convert::TryInto;
+
 async fn handle_msg(
     device: &mut Device,
-    msg: Vec<u8>,
-    out_tx: &mut mpsc::Sender<Vec<u8>>,
+    msg: Msg,
+    out_tx: &mut mpsc::Sender<Msg>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     //let (cid, cmd, _) = u2fframing::parse_header(&msg[..])?;
 
@@ -230,20 +241,51 @@ async fn handle_msg(
     //))?;
 
     //let mut hidcodec = U2FHID::new(cmd);
-    let mut buf = [0u8; 7 + 7609]; // Maximally supported size by u2f
+    let mut buf = [0u8; ellocopo2::MAX_MSG_SZ]; // Maximally supported size by u2f
+    let mut echo = [0u8; ellocopo2::MAX_MSG_SZ];
+    let Msg(code, path, value) = msg;
     //let len = hidcodec.encode(&res[..], &mut buf[..])?;
-    
-    device.write_all(&msg[..]).await?;
+    let request_sz = RequestBuilder::new(&mut echo)
+                .code(code.try_into().unwrap())
+                .path(&path)
+                .payload(NotOwnValue::from(&value))
+                .build()
+                .unwrap();
+    let echo = &echo[0..request_sz];
+
+    device.write_all(&echo[..]).await?;
 
     let mut len = 0;
     loop {
         let this_len = device.read(&mut buf[len..]).await?;
         len += this_len;
 
-        if let Err(e) = out_tx.send(buf[..len].to_vec()).await {
+        let mut parser = ParseMsg::new();
+        let ans = parser.try_parse(&buf[..len]);
+
+        match ans {
+            Err(ellocopo2::ParserError::NeedMoreData) => {
+                info!("Need more data");
+            }
+            Ok(ans) => {
+                let val: Value = ans.2.try_into().unwrap();
+                let msg = Msg (ans.0, ans.1.to_string(), val);
+                if let Err(e) = out_tx.send(msg).await {
+                    error!("Failed to send internally: {}", e);
+                }
+                info!("Answer : {:x?}", ans);
+                break;
+            }
+            Err(err) => {
+                //info!("buf: {:x?}, size: {}", &buf[..], offset+r.len());
+                panic!("Error: {:?}", err);
+            }
+        }
+
+        /*if let Err(e) = out_tx.send(buf[temp..len].to_vec()).await {
             error!("Failed to send internally: {}", e);
         }
-        break;
+        break;*/
 
         ////let res = hidcodec.decode(&buf[..len])?;
         //if let Some(res) = res {
@@ -261,8 +303,8 @@ async fn handle_msg(
 
 async fn device_loop(
     mut device: Device,
-    mut in_rx: mpsc::Receiver<Vec<u8>>,
-    mut out_tx: mpsc::Sender<Vec<u8>>,
+    mut in_rx: mpsc::Receiver<Msg>,
+    mut out_tx: mpsc::Sender<Msg>,
     mut on_close_rx: mpsc::Receiver<oneshot::Sender<()>>,
 ) {
     loop {
@@ -273,7 +315,7 @@ async fn device_loop(
                         error!("message ignored: {}", e);
                     }
                 } else {
-                    error!("dev channel closed");
+                    info!("dev channel closed");
                     return;
                 }
             },
